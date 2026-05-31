@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, request, send_from_directory, abort
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from backend.parser import parse_pcap, parse_packet_detail
@@ -63,7 +64,19 @@ app = Flask(
     static_folder=str(FRONTEND / "static"),
     template_folder=str(FRONTEND / "templates"),
 )
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB cap
+# Upload size cap. Default 4 GB so multi-gig pcaps load on a workstation; the
+# env var lets you raise/lower it without code changes. Note that scapy's
+# rdpcap() reads the whole file into memory, so even a 2 GB pcap can need
+# ~10 GB of RAM to parse — split big captures with `editcap -c` if you hit OOM.
+MAX_UPLOAD_MB = int(os.environ.get("P_SEQ_MAX_UPLOAD_MB", "4096"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _too_large(_e):
+    # Without this handler Flask returns its default HTML 413 page, which the
+    # JS frontend then chokes on with "Unexpected token '<'…".
+    return jsonify(error=f"file too large (max {MAX_UPLOAD_MB} MB; raise P_SEQ_MAX_UPLOAD_MB)"), 413
 
 
 # ---------- request-level security middleware ----------

@@ -30,6 +30,23 @@
   // CORS preflight).
   const CSRF_HEADERS = { "X-Requested-By": "p-seq" };
 
+  // Read a response that's expected to be JSON. If the server returned an
+  // error page (HTML), we surface the status code instead of crashing on the
+  // JSON parse — this matters for things like the 413 "too large" page that
+  // Flask serves before our handler can intercept on edge cases.
+  async function jsonOrThrow(r, fallback) {
+    if (r.ok) return r.json();
+    let msg = `${fallback} (HTTP ${r.status})`;
+    try {
+      const text = await r.text();
+      try {
+        const j = JSON.parse(text);
+        if (j && j.error) msg = j.error;
+      } catch { /* not JSON — keep the HTTP-status message */ }
+    } catch { /* unreadable body — keep generic */ }
+    throw new Error(msg);
+  }
+
   const api = {
     async list() { return (await fetch("/api/pcaps")).json(); },
     async upload(file) {
@@ -40,8 +57,7 @@
         body: fd,
         headers: { ...CSRF_HEADERS },
       });
-      if (!r.ok) throw new Error((await r.json()).error || "upload failed");
-      return r.json();
+      return jsonOrThrow(r, "upload failed");
     },
     async del(id) {
       const r = await fetch(`/api/pcaps/${id}`, {
@@ -61,8 +77,7 @@
         headers: { "Content-Type": "application/json", ...CSRF_HEADERS },
         body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error((await r.json()).error || "packets failed");
-      return r.json();
+      return jsonOrThrow(r, "packets failed");
     },
     async detail(id, frame) {
       const r = await fetch(`/api/pcaps/${id}/packets/${frame}`);
