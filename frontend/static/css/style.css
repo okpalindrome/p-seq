@@ -107,14 +107,16 @@ a { color: inherit; }
   overflow: hidden;
 }
 .diagram-title {
-  height: 34px;
-  padding: 0 12px;
+  min-height: 34px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--line);
   font-family: var(--mono);
   font-size: 12px;
   display: flex;
   align-items: center;
   flex: 0 0 auto;
+  line-height: 1.4;
+  word-break: break-word;
 }
 .diagram-wrap {
   flex: 1;
@@ -180,6 +182,7 @@ a { color: inherit; }
   font-family: var(--mono);
   font-size: 12px;
 }
+#renderProgress { margin-top: 6px; }
 .upload-progress-head {
   display: flex;
   justify-content: space-between;
@@ -292,11 +295,11 @@ a { color: inherit; }
 
 /* detail pane */
 .detail-header {
-  height: 34px;
+  min-height: 34px;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0 10px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--line);
   font-family: var(--mono);
   font-size: 12px;
@@ -345,6 +348,16 @@ a { color: inherit; }
   font-size: 11px;
   line-height: 1;
 }
+
+.hide-row {
+  border: 1px solid var(--line);
+  padding: 8px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hide-row .btn { width: 100%; }
 
 .layer-node {
   border-left: 2px solid var(--line);
@@ -433,6 +446,31 @@ a { color: inherit; }
   cursor: pointer;
 }
 .collapse-bg { fill: var(--bg); stroke: var(--line); cursor: pointer; }
+
+/* User-hidden run cluster — distinct from auto-collapse by using a softer
+   muted gray, thinner dashed strokes, and italic label. */
+.hidden-line {
+  stroke: var(--muted);
+  stroke-width: 0.5;
+  stroke-dasharray: 2 3;
+}
+.hidden-bg {
+  fill: var(--bg);
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  cursor: pointer;
+}
+.hidden-bg:hover { stroke: var(--fg); }
+.hidden-dots circle { fill: var(--muted); cursor: pointer; }
+.hidden-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  fill: var(--muted);
+  font-style: italic;
+  cursor: pointer;
+  pointer-events: all;
+}
 
 /* modal */
 .modal {

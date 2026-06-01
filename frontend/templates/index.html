@@ -38,7 +38,19 @@
       <div id="portPickerBody"></div>
     </div>
 
-    <button id="renderBtn" class="btn block" disabled>Render diagram</button>
+    <div id="renderArea">
+      <button id="renderBtn" class="btn block" disabled>Render diagram</button>
+      <div id="renderProgress" class="upload-progress hidden">
+        <div class="upload-progress-head">
+          <span class="upload-progress-stage" id="renderStage">Rendering</span>
+          <span class="upload-progress-pct" id="renderElapsed">0.0s</span>
+        </div>
+        <div class="upload-bar"><div class="upload-bar-fill indeterminate"></div></div>
+        <div class="upload-progress-meta">
+          <span id="renderMeta"></span>
+        </div>
+      </div>
+    </div>
 
     <h3 class="section-title">Parties</h3>
     <p class="muted small">Pick exactly two endpoints (max 2).</p>

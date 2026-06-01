@@ -17,6 +17,7 @@
     view: { scale: 1, tx: 0, ty: 0 },  // diagram viewport transform
     contentBounds: { w: 0, h: 0 },     // natural content size
     labels: {},               // frame_no(str) -> user label
+    hidden: new Set(),        // frame_no(int) — user-hidden frames (rendered as dots)
     settings: {
       collapseThreshold: 5,
       showSeconds: false,
@@ -126,6 +127,34 @@
       if (!r.ok) throw new Error("save label failed");
       return r.json();
     },
+    async getHidden(id) {
+      const r = await fetch(`/api/pcaps/${id}/hidden`);
+      if (!r.ok) return [];
+      return r.json();
+    },
+    async hide(id, frame) {
+      const r = await fetch(`/api/pcaps/${id}/hidden/${frame}`, {
+        method: "PUT", headers: { ...CSRF_HEADERS },
+      });
+      if (!r.ok) throw new Error("hide failed");
+      return r.json();
+    },
+    async unhide(id, frame) {
+      const r = await fetch(`/api/pcaps/${id}/hidden/${frame}`, {
+        method: "DELETE", headers: { ...CSRF_HEADERS },
+      });
+      if (!r.ok) throw new Error("unhide failed");
+      return r.json();
+    },
+    async batchHidden(id, action, frames) {
+      const r = await fetch(`/api/pcaps/${id}/hidden:batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...CSRF_HEADERS },
+        body: JSON.stringify({ action, frames }),
+      });
+      if (!r.ok) throw new Error("batch hide failed");
+      return r.json();
+    },
   };
 
   const escapeHTML = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -191,9 +220,13 @@
     state.portChoice = { a: null, b: null };
     state.sequence = [];
     state.labels = {};
-    const [summary, labels] = await Promise.all([api.summary(id), api.getLabels(id)]);
+    state.hidden = new Set();
+    const [summary, labels, hidden] = await Promise.all([
+      api.summary(id), api.getLabels(id), api.getHidden(id),
+    ]);
     state.summary = summary;
     state.labels = labels || {};
+    state.hidden = new Set(hidden || []);
     refreshHistory();
     renderEndpoints();
     renderPortPicker();
@@ -293,6 +326,56 @@
     body.appendChild(makeRow(`${bIp} port`, bPorts, "b"));
   }
 
+  // ---------- render progress UI ----------
+  // Mirrors uploadUI: the "Render diagram" button slot is taken over by an
+  // indeterminate-bar + elapsed-time card while a packets request is in
+  // flight. The Apply button on the topbar also shows a busy state so the
+  // user gets feedback regardless of which button they pressed.
+  const renderUI = {
+    timer: null,
+    start: 0,
+    origApplyText: null,
+    busy(stage, meta) {
+      this._clearTimer();
+      $("renderBtn").classList.add("hidden");
+      $("renderProgress").classList.remove("hidden");
+      $("renderStage").textContent = stage;
+      $("renderMeta").textContent = meta || "";
+      const apply = $("applyFilter");
+      if (apply) {
+        if (this.origApplyText === null) this.origApplyText = apply.textContent;
+        apply.textContent = "…";
+        apply.disabled = true;
+      }
+      $("matchCount").textContent = "processing…";
+      this.start = Date.now();
+      const tick = () => {
+        const elapsed = (Date.now() - this.start) / 1000;
+        $("renderElapsed").textContent = `${elapsed.toFixed(1)}s`;
+      };
+      tick();
+      this.timer = setInterval(tick, 200);
+    },
+    update(stage, meta) {
+      $("renderStage").textContent = stage;
+      if (meta !== undefined) $("renderMeta").textContent = meta;
+    },
+    idle() {
+      this._clearTimer();
+      $("renderProgress").classList.add("hidden");
+      $("renderBtn").classList.remove("hidden");
+      const apply = $("applyFilter");
+      if (apply) {
+        if (this.origApplyText !== null) apply.textContent = this.origApplyText;
+        apply.disabled = false;
+      }
+      this.origApplyText = null;
+    },
+    _clearTimer() {
+      if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    },
+  };
+
   // ---------- packet fetch + diagram ----------
   async function renderRequested() {
     if (state.selected.length !== 2 || !state.currentPcap) return;
@@ -303,6 +386,11 @@
       party_b: { ip: bIp, port: state.portChoice.b },
       collapse_threshold: state.settings.collapseThreshold,
     };
+    const filterDesc = $("filter").value.trim();
+    renderUI.busy(
+      "Filtering",
+      `${aIp} ↔ ${bIp}${filterDesc ? `   ·   ${filterDesc}` : ""}`,
+    );
     try {
       const res = await api.packets(state.currentPcap, body);
       state.sequence = res.sequence;
@@ -310,16 +398,24 @@
       state.expandedCollapsed = new Set();
       state.view = { scale: 1, tx: 0, ty: 0 };
       $("matchCount").textContent = `${res.matched} / ${res.total} matched`;
+      // Stage transition: response is back, now we draw. For small renders
+      // this is invisible; for huge ones the user sees "Drawing" briefly.
+      renderUI.update("Drawing", `${res.matched} matched`);
+      // yield to the browser so the stage label paints before drawDiagram blocks
+      await new Promise((r) => requestAnimationFrame(r));
       renderDiagram();
       setDiagramTitle();
     } catch (e) {
       alert(e.message);
+    } finally {
+      renderUI.idle();
     }
   }
 
   function setDiagramTitle() {
     if (state.selected.length !== 2) {
       $("diagramTitle").textContent = "No diagram yet — upload a pcap and pick two parties.";
+      syncHeaderHeights();
       return;
     }
     const [a, b] = state.selected;
@@ -335,6 +431,17 @@
     } else {
       $("diagramTitle").textContent = head;
     }
+    syncHeaderHeights();
+  }
+
+  // When the diagram title wraps (long port-pair lists, narrow window) it
+  // grows beyond the default 34px. Force the right-pane "Packet details"
+  // header to grow too so the two horizontal border lines still line up.
+  function syncHeaderHeights() {
+    const dt = document.querySelector(".diagram-title");
+    const dh = document.querySelector(".detail-header");
+    if (!dt || !dh) return;
+    dh.style.minHeight = dt.offsetHeight + "px";
   }
 
   // SVG rendering
@@ -379,6 +486,14 @@
     const items = [];
     for (const item of state.sequence) {
       if (item.kind === "collapsed" && state.expandedCollapsed.has(item.first_frame)) {
+        // Header row above the expanded run gives the user a way back —
+        // clicking it re-folds the run into the dots cluster.
+        items.push({
+          kind: "expanded-header",
+          first_frame: item.first_frame,
+          last_frame: item.last_frame,
+          count: item.frames.length,
+        });
         for (let i = 0; i < item.frames.length; i++) {
           items.push({
             kind: "packet",
@@ -436,6 +551,10 @@
         const x1 = fromA ? xA : xB;
         const x2 = fromA ? xB : xA;
         drawCollapsed(viewG, x1, x2, cy, it);
+      } else if (it.kind === "hidden") {
+        drawHidden(viewG, xA, xB, cy, it);
+      } else if (it.kind === "expanded-header") {
+        drawExpandedHeader(viewG, xA, xB, cy, it);
       }
       y += rowH;
     });
@@ -525,6 +644,88 @@
     for (const el of handlers) el.addEventListener("click", handler);
   }
 
+  // Header above an expanded auto-collapsed run — clicking re-folds the run
+  // back into a single dots pill so the user can compact noise after peeking.
+  function drawExpandedHeader(svg, xA, xB, y, it) {
+    const key = `exp:${it.first_frame}`;
+    const cx = (xA + xB) / 2;
+    const text = `▴ ${it.count}× #${it.first_frame}–${it.last_frame}  ·  click to collapse`;
+    const w = pillWidthFor(text, 180);
+
+    svgEl("line", {
+      x1: xA + 8, y1: y, x2: cx - w / 2, y2: y,
+      class: "arrow", "stroke-dasharray": "3 4", "data-key": key,
+    }, svg);
+    svgEl("line", {
+      x1: cx + w / 2, y1: y, x2: xB - 8, y2: y,
+      class: "arrow", "stroke-dasharray": "3 4", "data-key": key,
+    }, svg);
+    svgEl("rect", {
+      x: cx - w / 2, y: y - 11, width: w, height: 22,
+      class: "collapse-bg", "data-key": key,
+    }, svg);
+    const lbl = svgEl("text", {
+      x: cx, y: y + 4, "text-anchor": "middle", class: "collapse-label", "data-key": key,
+    }, svg);
+    lbl.textContent = text;
+
+    const handler = () => {
+      state.expandedCollapsed.delete(it.first_frame);
+      renderDiagram();
+    };
+    svg.querySelectorAll(`[data-key="${key}"]`).forEach((el) => el.addEventListener("click", handler));
+  }
+
+  // User-hidden run: dashed line + 3 ghost dots + "N hidden" pill. Span both
+  // lifelines because a hidden run may contain packets going in both
+  // directions; we just communicate "stuff happened here, click to bring it
+  // back". Clicking the cluster unhides every frame it represents.
+  function drawHidden(svg, xA, xB, y, it) {
+    const key = `hid:${it.first_frame}`;
+    const cx = (xA + xB) / 2;
+    const hText = `${it.count} hidden — click to show`;
+    const cw = pillWidthFor(hText, 150);
+
+    // dashed line from each lifeline up to the pill
+    svgEl("line", {
+      x1: xA + 8, y1: y, x2: cx - cw / 2, y2: y,
+      class: "hidden-line", "data-key": key,
+    }, svg);
+    svgEl("line", {
+      x1: cx + cw / 2, y1: y, x2: xB - 8, y2: y,
+      class: "hidden-line", "data-key": key,
+    }, svg);
+
+    const rect = svgEl("rect", {
+      x: cx - cw / 2, y: y - 11, width: cw, height: 22,
+      class: "hidden-bg", "data-key": key,
+    }, svg);
+    const g = svgEl("g", { class: "hidden-dots", "data-key": key }, svg);
+    [-14, 0, 14].forEach((dx) => svgEl("circle", { cx: cx + dx, cy: y - 3, r: 1.8 }, g));
+    const lbl = svgEl("text", {
+      x: cx, y: y + 7, "text-anchor": "middle", class: "hidden-label", "data-key": key,
+    }, svg);
+    lbl.textContent = hText;
+    const titleEl = svgEl("title", {}, lbl);
+    titleEl.textContent = `Hidden frames: ${it.frames.join(", ")}`;
+
+    const handler = async () => {
+      try {
+        await api.batchHidden(state.currentPcap, "remove", it.frames);
+        for (const f of it.frames) state.hidden.delete(f);
+        renderRequested();
+      } catch (e) { alert(e.message); }
+    };
+    for (const el of [rect, g, lbl, ...svg.querySelectorAll(`[data-key="${key}"]`)]) {
+      el.addEventListener("click", handler);
+    }
+  }
+
+  // Rough monospace pixel-width at 10 px font (used to size the pills around
+  // collapse/hidden labels so the text never spills outside the border).
+  const MONO_CHAR_PX = 6.5;
+  const pillWidthFor = (text, minPx) => Math.max(minPx, Math.ceil(text.length * MONO_CHAR_PX + 24));
+
   function drawCollapsed(svg, x1, x2, y, it) {
     const key = `col:${it.first_frame}`;
     const dir = x2 > x1 ? 1 : -1;
@@ -533,9 +734,24 @@
     const toX = x2 - dir * pad;
     const cx = (fromX + toX) / 2;
 
-    // dotted line
+    // Compute label text up front so we can size the pill to fit.
+    let cText = `${it.count}× #${it.first_frame}–${it.last_frame}`;
+    if (state.settings.showSeconds && typeof it.epoch === "number") {
+      const a = fmtRelSecs(it.epoch);
+      const b = fmtRelSecs(it.epoch_last);
+      if (a && b) cText = `${a}→${b}  ${cText}`;
+    }
+    cText += "  (click to expand)";
+    const w = pillWidthFor(cText, 150);
+    const h = 22;
+
+    // dotted line (broken around the pill so the line doesn't pass under it)
     svgEl("line", {
-      x1: fromX, y1: y, x2: toX, y2: y,
+      x1: fromX, y1: y, x2: cx - w / 2, y2: y,
+      class: "arrow", "stroke-dasharray": "3 4", "data-key": key,
+    }, svg);
+    svgEl("line", {
+      x1: cx + w / 2, y1: y, x2: toX, y2: y,
       class: "arrow", "stroke-dasharray": "3 4", "data-key": key,
     }, svg);
 
@@ -547,8 +763,7 @@
       class: "arrow-head", "data-key": key,
     }, svg);
 
-    // dots cluster in the middle with count
-    const w = 90, h = 22;
+    // pill background + dots cluster + label
     svgEl("rect", {
       x: cx - w / 2, y: y - h / 2, width: w, height: h,
       class: "collapse-bg", "data-key": key,
@@ -556,15 +771,8 @@
     const g = svgEl("g", { class: "collapse-dots", "data-key": key }, svg);
     [-12, 0, 12].forEach((dx) => svgEl("circle", { cx: cx + dx, cy: y - 4, r: 2 }, g));
     const lbl = svgEl("text", {
-      x: cx, y: y + 8, "text-anchor": "middle", class: "collapse-label", "data-key": key,
+      x: cx, y: y + 7, "text-anchor": "middle", class: "collapse-label", "data-key": key,
     }, svg);
-    let cText = `${it.count}× #${it.first_frame}–${it.last_frame}`;
-    if (state.settings.showSeconds && typeof it.epoch === "number") {
-      const a = fmtRelSecs(it.epoch);
-      const b = fmtRelSecs(it.epoch_last);
-      if (a && b) cText = `${a}→${b}  ${cText}`;
-    }
-    cText += "  (click to expand)";
     lbl.textContent = cText;
 
     const handler = () => {
@@ -811,6 +1019,34 @@
       if (e.key === "Enter") { e.preventDefault(); save(); }
     });
 
+    // ---- Hide / Unhide this packet ----
+    const isHidden = d.hidden === true || state.hidden.has(d.frame);
+    if (isHidden) state.hidden.add(d.frame); else state.hidden.delete(d.frame);
+    const hideRow = document.createElement("div");
+    hideRow.className = "hide-row";
+    hideRow.innerHTML = `
+      <button id="frameHideToggle" class="btn small block-btn">
+        ${isHidden ? "Unhide this packet" : "Hide this packet"}
+      </button>
+      <span class="muted small">${isHidden
+        ? "Hidden — appears as dots in the diagram"
+        : "Click to replace this arrow with a dots cluster"}</span>
+    `;
+    body.appendChild(hideRow);
+    hideRow.querySelector("#frameHideToggle").addEventListener("click", async () => {
+      try {
+        if (state.hidden.has(d.frame)) {
+          await api.unhide(state.currentPcap, d.frame);
+          state.hidden.delete(d.frame);
+        } else {
+          await api.hide(state.currentPcap, d.frame);
+          state.hidden.add(d.frame);
+        }
+        // hiding/unhiding changes sequence grouping → re-fetch from server
+        renderRequested();
+      } catch (e) { alert(e.message); }
+    });
+
     // ---- Summary header (frame, time, length, encap) ----
     const head = document.createElement("div");
     head.className = "layer-node open";
@@ -888,6 +1124,10 @@
     .collapse-bg{fill:#fff;stroke:#000}
     .collapse-dots circle{fill:#000}
     .collapse-label{font-family:monospace;font-size:10px;fill:#000}
+    .hidden-line{stroke:#5a5a5a;stroke-width:0.5;stroke-dasharray:2 3}
+    .hidden-bg{fill:#fff;stroke:#5a5a5a;stroke-width:1;stroke-dasharray:2 2}
+    .hidden-dots circle{fill:#5a5a5a}
+    .hidden-label{font-family:monospace;font-size:10px;font-style:italic;fill:#5a5a5a}
   `;
   function exportPng() {
     const svg = $("diagram");
@@ -1061,6 +1301,7 @@
   initPanZoom();
   window.addEventListener("resize", () => {
     if (state.sequence.length || state.selected.length === 2) renderDiagram();
+    syncHeaderHeights();
   });
   refreshHistory();
 })();

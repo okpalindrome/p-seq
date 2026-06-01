@@ -192,6 +192,36 @@ def _labels_path(pcap_id: str) -> Path:
     return _safe_storage_path(f"{pcap_id}_labels.json")
 
 
+# ---------- per-packet hidden-set storage ----------
+# Same persistence shape as labels — one JSON file per pcap, with a sorted
+# array of frame numbers the user has explicitly hidden. Hidden packets still
+# appear in the diagram, but as a dashed "N hidden" cluster instead of an
+# arrow, so the user knows traffic happened there without it taking visual
+# space.
+
+def _hidden_path(pcap_id: str) -> Path:
+    if not _VALID_PCAP_ID.match(pcap_id):
+        raise ValueError("invalid pcap id")
+    return _safe_storage_path(f"{pcap_id}_hidden.json")
+
+
+def _load_hidden(pcap_id: str) -> set[int]:
+    p = _hidden_path(pcap_id)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {int(x) for x in data if isinstance(x, (int, str)) and str(x).lstrip("-").isdigit()}
+    except Exception:
+        return set()
+
+
+def _save_hidden(pcap_id: str, frames: set[int]) -> None:
+    _hidden_path(pcap_id).write_text(
+        json.dumps(sorted(frames), indent=2), encoding="utf-8"
+    )
+
+
 def _load_labels(pcap_id: str) -> dict[str, str]:
     p = _labels_path(pcap_id)
     if not p.exists():
@@ -276,17 +306,18 @@ def delete_pcap(pcap_id: str):
     new_items = [it for it in items if it["id"] != pcap_id]
     if len(new_items) == len(items):
         return jsonify(error="not found"), 404
-    # find the file (and its labels file) and delete them
+    # find the file and its sidecar files (labels, hidden), delete all of them
     for it in items:
         if it["id"] == pcap_id:
-            try:
-                _safe_storage_path(it["filename"]).unlink(missing_ok=True)
-            except ValueError:
-                pass
-            try:
-                _labels_path(pcap_id).unlink(missing_ok=True)
-            except ValueError:
-                pass
+            for resolver in (
+                lambda: _safe_storage_path(it["filename"]),
+                lambda: _labels_path(pcap_id),
+                lambda: _hidden_path(pcap_id),
+            ):
+                try:
+                    resolver().unlink(missing_ok=True)
+                except ValueError:
+                    pass
     _save_index(new_items)
     _CACHE.pop(pcap_id, None)
     return jsonify(ok=True)
@@ -363,14 +394,17 @@ def pcap_packets(pcap_id: str):
         key=lambda p: (p.get("epoch") or 0, p.get("frame") or 0),
     )
 
-    # Attach the current label (if any) to each matched packet. Labels also
+    # Attach the current label and hidden flag to each matched packet. Labels
     # participate in the collapse signature so a labeled packet always stays
-    # as its own visible arrow on the diagram.
+    # as its own visible arrow. Hidden packets are pulled out of the normal
+    # collapse pass entirely and grouped into their own "hidden" blocks.
     labels = _load_labels(pcap_id)
+    hidden = _load_hidden(pcap_id)
     matched = []
     for p in matched_raw:
         q = dict(p)
         q["label"] = labels.get(str(p["frame"]), "")
+        q["hidden"] = p["frame"] in hidden
         matched.append(q)
 
     # Distinct port pairs present in the matched set (for the UI title hint).
@@ -390,10 +424,36 @@ def pcap_packets(pcap_id: str):
         seen.add(key)
         port_pairs.append({"a_port": key[0], "b_port": key[1], "proto": key[2]})
 
-    # collapse runs of identical successive packets (same src/dst/ports/payload_hex/label)
+    # Build the rendered sequence. Three kinds of items can appear:
+    #   - "packet"    : a single visible arrow
+    #   - "collapsed" : an auto-collapsed run of identical visible packets
+    #   - "hidden"    : a run of user-hidden packets (rendered as dots)
     sequence: list[dict[str, Any]] = []
+    n_matched = len(matched)
     i = 0
-    while i < len(matched):
+    while i < n_matched:
+        # Hidden run: consume consecutive hidden packets regardless of payload
+        # so a long stretch of muted noise stays a single compact cluster.
+        if matched[i].get("hidden"):
+            j = i + 1
+            while j < n_matched and matched[j].get("hidden"):
+                j += 1
+            run = matched[i:j]
+            sequence.append({
+                "kind": "hidden",
+                "count": len(run),
+                "first_frame": run[0]["frame"],
+                "last_frame": run[-1]["frame"],
+                "epoch": run[0].get("epoch"),
+                "epoch_last": run[-1].get("epoch"),
+                "src_ip": run[0].get("src_ip"),
+                "dst_ip": run[0].get("dst_ip"),
+                "frames": [p["frame"] for p in run],
+            })
+            i = j
+            continue
+
+        # Visible auto-collapse: identical signature, also not hidden.
         run = [matched[i]]
         j = i + 1
         sig = (
@@ -402,7 +462,7 @@ def pcap_packets(pcap_id: str):
             matched[i].get("proto"), matched[i].get("payload_hex"),
             matched[i].get("info"), matched[i].get("label", ""),
         )
-        while j < len(matched):
+        while j < n_matched and not matched[j].get("hidden"):
             jsig = (
                 matched[j].get("src_ip"), matched[j].get("dst_ip"),
                 matched[j].get("src_port"), matched[j].get("dst_port"),
@@ -460,6 +520,7 @@ def pcap_packet_detail(pcap_id: str, frame_no: int):
     if detail is None:
         return jsonify(error="frame out of range"), 404
     detail["label"] = _load_labels(pcap_id).get(str(frame_no), "")
+    detail["hidden"] = frame_no in _load_hidden(pcap_id)
     return jsonify(detail)
 
 
@@ -497,6 +558,62 @@ def delete_label(pcap_id: str, frame_no: int):
     labels.pop(str(frame_no), None)
     _save_labels(pcap_id, labels)
     return jsonify(ok=True)
+
+
+# ---------- per-packet hide CRUD ----------
+
+@app.get("/api/pcaps/<pcap_id>/hidden")
+def list_hidden(pcap_id: str):
+    if not _get_entry(pcap_id):
+        return jsonify(error="not found"), 404
+    return jsonify(sorted(_load_hidden(pcap_id)))
+
+
+@app.put("/api/pcaps/<pcap_id>/hidden/<int:frame_no>")
+def hide_frame(pcap_id: str, frame_no: int):
+    if not _get_entry(pcap_id):
+        return jsonify(error="not found"), 404
+    if frame_no < 1 or frame_no > 10_000_000:
+        return jsonify(error="invalid frame"), 400
+    h = _load_hidden(pcap_id)
+    h.add(frame_no)
+    _save_hidden(pcap_id, h)
+    return jsonify(ok=True, frame=frame_no, hidden=True)
+
+
+@app.delete("/api/pcaps/<pcap_id>/hidden/<int:frame_no>")
+def unhide_frame(pcap_id: str, frame_no: int):
+    if not _get_entry(pcap_id):
+        return jsonify(error="not found"), 404
+    h = _load_hidden(pcap_id)
+    h.discard(frame_no)
+    _save_hidden(pcap_id, h)
+    return jsonify(ok=True, frame=frame_no, hidden=False)
+
+
+# Batch endpoint — unhiding a whole cluster in one round trip when the user
+# clicks an "N hidden" dots block in the diagram.
+@app.post("/api/pcaps/<pcap_id>/hidden:batch")
+def batch_hidden(pcap_id: str):
+    if not _get_entry(pcap_id):
+        return jsonify(error="not found"), 404
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    frames = body.get("frames") or []
+    if action not in ("add", "remove"):
+        return jsonify(error="action must be 'add' or 'remove'"), 400
+    try:
+        frames = [int(f) for f in frames]
+    except (TypeError, ValueError):
+        return jsonify(error="frames must be integers"), 400
+    h = _load_hidden(pcap_id)
+    if action == "add":
+        h.update(f for f in frames if 1 <= f <= 10_000_000)
+    else:
+        for f in frames:
+            h.discard(f)
+    _save_hidden(pcap_id, h)
+    return jsonify(ok=True, count=len(h))
 
 
 # ---------- entry point ----------
