@@ -194,7 +194,7 @@
       `;
       li.addEventListener("click", (e) => {
         if (e.target.classList.contains("del")) return;
-        selectPcap(it.id);
+        selectPcap(it.id, it);
       });
       li.querySelector(".del").addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -214,19 +214,34 @@
     }
   }
 
-  async function selectPcap(id) {
+  async function selectPcap(id, entryHint) {
     state.currentPcap = id;
     state.selected = [];
     state.portChoice = { a: null, b: null };
     state.sequence = [];
     state.labels = {};
     state.hidden = new Set();
-    const [summary, labels, hidden] = await Promise.all([
-      api.summary(id), api.getLabels(id), api.getHidden(id),
-    ]);
-    state.summary = summary;
-    state.labels = labels || {};
-    state.hidden = new Set(hidden || []);
+
+    const name = entryHint && entryHint.name ? entryHint.name : id;
+    const sizeText = entryHint && typeof entryHint.size_bytes === "number"
+      ? fmtBytes(entryHint.size_bytes)
+      : "";
+    const meta = sizeText ? `${name}   ·   ${sizeText}` : name;
+    loadingUI.busy("Loading pcap", meta);
+
+    try {
+      const [summary, labels, hidden] = await Promise.all([
+        api.summary(id), api.getLabels(id), api.getHidden(id),
+      ]);
+      state.summary = summary;
+      state.labels = labels || {};
+      state.hidden = new Set(hidden || []);
+    } catch (e) {
+      loadingUI.idle();
+      alert(e.message || "failed to load pcap");
+      return;
+    }
+    loadingUI.idle();
     refreshHistory();
     renderEndpoints();
     renderPortPicker();
@@ -325,6 +340,36 @@
     body.appendChild(makeRow(`${aIp} port`, aPorts, "a"));
     body.appendChild(makeRow(`${bIp} port`, bPorts, "b"));
   }
+
+  // ---------- pcap-load progress UI ----------
+  // Shown over the diagram pane while selectPcap is running. The slow part is
+  // the server-side parse_pcap inside /summary when the pcap isn't cached yet;
+  // we can't get a real % but the elapsed timer + indeterminate bar reassure
+  // the user the app isn't dead.
+  const loadingUI = {
+    timer: null,
+    start: 0,
+    busy(stage, meta) {
+      this._clear();
+      this.start = Date.now();
+      $("loadingStage").textContent = stage;
+      $("loadingMeta").textContent = meta || "";
+      $("loadingOverlay").classList.remove("hidden");
+      const tick = () => {
+        const elapsed = (Date.now() - this.start) / 1000;
+        $("loadingElapsed").textContent = `${elapsed.toFixed(1)}s`;
+      };
+      tick();
+      this.timer = setInterval(tick, 200);
+    },
+    idle() {
+      this._clear();
+      $("loadingOverlay").classList.add("hidden");
+    },
+    _clear() {
+      if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    },
+  };
 
   // ---------- render progress UI ----------
   // Mirrors uploadUI: the "Render diagram" button slot is taken over by an
@@ -1263,7 +1308,7 @@
         uploadUI.idle();
         e.target.value = "";
         await refreshHistory();
-        await selectPcap(entry.id);
+        await selectPcap(entry.id, entry);
       } catch (err) {
         uploadUI.idle();
         alert(err.message);

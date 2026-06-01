@@ -64,6 +64,18 @@
     <div id="diagramTitle" class="diagram-title muted">No diagram yet — upload a pcap and pick two parties.</div>
     <div id="diagramWrap" class="diagram-wrap">
       <svg id="diagram" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="loadingOverlay" class="loading-overlay hidden">
+        <div class="upload-progress loading-card">
+          <div class="upload-progress-head">
+            <span class="upload-progress-stage" id="loadingStage">Loading pcap</span>
+            <span class="upload-progress-pct" id="loadingElapsed">0.0s</span>
+          </div>
+          <div class="upload-bar"><div class="upload-bar-fill indeterminate"></div></div>
+          <div class="upload-progress-meta">
+            <span id="loadingMeta"></span>
+          </div>
+        </div>
+      </div>
       <div class="zoom-controls" title="Pinch / scroll to zoom · drag to pan">
         <button id="zoomOut" class="btn" title="Zoom out">−</button>
         <span id="zoomLevel" class="zoom-level">100%</span>
