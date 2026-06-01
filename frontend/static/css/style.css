@@ -39,10 +39,15 @@ a { color: inherit; }
 }
 .brand {
   font-weight: 700;
-  letter-spacing: 1px;
+  letter-spacing: 2px;
   font-family: var(--mono);
+  font-size: 13px;
   border: 1px solid var(--line);
-  padding: 2px 8px;
+  height: 30px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
 }
 .filterbox {
   flex: 1;
@@ -54,12 +59,25 @@ a { color: inherit; }
   flex: 1;
   font-family: var(--mono);
   font-size: 13px;
-  padding: 6px 8px;
+  height: 30px;
+  padding: 0 8px;
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--fg);
+  box-sizing: border-box;
 }
 #filter:focus { outline: 2px solid var(--line); outline-offset: -1px; }
+
+/* Force every interactive element in the topbar to the same 30px row height
+   so the brand, filter input, Apply, gear, and Export PNG all line up. */
+.topbar .btn {
+  height: 30px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
 
 .topbar-actions { display: flex; gap: 6px; }
 
@@ -151,7 +169,62 @@ a { color: inherit; }
 }
 .upload { margin-bottom: 4px; }
 .upload .btn.block { width: 100%; margin-top: 0; text-align: center; }
-#uploadHint { margin-top: 6px; }
+.upload-hint { margin-top: 6px; }
+
+/* Upload progress view (replaces the button while a file is being sent /
+   parsed). Matches the button's box: 1px border, no rounded corners,
+   monospace status text. */
+.upload-progress {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.upload-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.upload-progress-stage {
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.upload-progress-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+.upload-bar {
+  height: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  overflow: hidden;
+  position: relative;
+}
+.upload-bar-fill {
+  height: 100%;
+  background: var(--fg);
+  width: 0%;
+  transition: width 120ms linear;
+}
+.upload-bar-fill.indeterminate {
+  width: 28% !important;
+  transition: none;
+  animation: pseqIndeterminate 1.2s linear infinite;
+}
+@keyframes pseqIndeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(360%); }
+}
+.upload-progress-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+}
 
 .history-list { list-style: none; padding: 0; margin: 0; }
 .history-list li {

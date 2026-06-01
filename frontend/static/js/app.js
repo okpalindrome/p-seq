@@ -47,17 +47,45 @@
     throw new Error(msg);
   }
 
-  const api = {
-    async list() { return (await fetch("/api/pcaps")).json(); },
-    async upload(file) {
+  // XHR-based upload — fetch() doesn't give upload progress events without the
+  // streams API. `onUploadPct(fraction)` is called continuously during the
+  // network upload; `onParsing()` fires once the bytes are fully on the wire
+  // and the server begins parsing (response not yet received).
+  function uploadWithProgress(file, onUploadPct, onParsing) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
       const fd = new FormData();
       fd.append("file", file);
-      const r = await fetch("/api/pcaps", {
-        method: "POST",
-        body: fd,
-        headers: { ...CSRF_HEADERS },
+      xhr.open("POST", "/api/pcaps");
+      xhr.setRequestHeader("X-Requested-By", "p-seq");
+      xhr.upload.addEventListener("progress", (e) => {
+        if (e.lengthComputable) onUploadPct(e.loaded / e.total);
       });
-      return jsonOrThrow(r, "upload failed");
+      xhr.upload.addEventListener("load", () => {
+        onUploadPct(1);
+        onParsing();
+      });
+      xhr.addEventListener("load", () => {
+        const text = xhr.responseText;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(text)); }
+          catch { reject(new Error("upload failed: response was not JSON")); }
+        } else {
+          let msg = `upload failed (HTTP ${xhr.status})`;
+          try { msg = JSON.parse(text).error || msg; } catch {}
+          reject(new Error(msg));
+        }
+      });
+      xhr.addEventListener("error", () => reject(new Error("upload network error")));
+      xhr.addEventListener("abort", () => reject(new Error("upload aborted")));
+      xhr.send(fd);
+    });
+  }
+
+  const api = {
+    async list() { return (await fetch("/api/pcaps")).json(); },
+    async upload(file, onUploadPct, onParsing) {
+      return uploadWithProgress(file, onUploadPct, onParsing);
     },
     async del(id) {
       const r = await fetch(`/api/pcaps/${id}`, {
@@ -909,17 +937,95 @@
     img.src = url;
   }
 
+  // ---------- upload area UI state machine ----------
+  // The "Upload pcap" button gets replaced by a progress card while a file is
+  // being uploaded and then parsed on the server. Three visual states:
+  //   idle      → button + hint
+  //   uploading → real % from XHR upload progress events
+  //   parsing   → indeterminate bar + elapsed-time counter (server is busy
+  //               turning the bytes into Scapy packets; we don't have a real %
+  //               until the response comes back)
+  const uploadUI = {
+    parseTimer: null,
+    parseStart: 0,
+    fileSizeText: "",
+
+    idle() {
+      this._clearTimer();
+      $("uploadArea").innerHTML = `
+        <label class="btn block" for="fileInput">Upload pcap</label>
+        <div class="muted small upload-hint">pcap / pcapng / cap</div>
+      `;
+    },
+    uploading(pct) {
+      const p = Math.max(0, Math.min(1, pct));
+      const pctStr = `${Math.floor(p * 100)}%`;
+      const sent = fmtBytes(Math.floor(p * (this.fileSize || 0)));
+      $("uploadArea").innerHTML = `
+        <div class="upload-progress">
+          <div class="upload-progress-head">
+            <span class="upload-progress-stage">Uploading</span>
+            <span class="upload-progress-pct">${pctStr}</span>
+          </div>
+          <div class="upload-bar"><div class="upload-bar-fill" style="width:${pctStr}"></div></div>
+          <div class="upload-progress-meta">
+            <span>${escapeHTML(this.fileName || "")}</span>
+            <span>${escapeHTML(sent)} / ${escapeHTML(this.fileSizeText)}</span>
+          </div>
+        </div>
+      `;
+    },
+    parsing() {
+      this._clearTimer();
+      this.parseStart = Date.now();
+      const tick = () => {
+        const elapsed = (Date.now() - this.parseStart) / 1000;
+        $("uploadArea").innerHTML = `
+          <div class="upload-progress">
+            <div class="upload-progress-head">
+              <span class="upload-progress-stage">Parsing</span>
+              <span class="upload-progress-pct">${elapsed.toFixed(1)}s</span>
+            </div>
+            <div class="upload-bar"><div class="upload-bar-fill indeterminate"></div></div>
+            <div class="upload-progress-meta">
+              <span>${escapeHTML(this.fileName || "")}</span>
+              <span>${escapeHTML(this.fileSizeText)} · scapy rdpcap</span>
+            </div>
+          </div>
+        `;
+      };
+      tick();
+      this.parseTimer = setInterval(tick, 200);
+    },
+    _clearTimer() {
+      if (this.parseTimer) { clearInterval(this.parseTimer); this.parseTimer = null; }
+    },
+    armForFile(f) {
+      this.fileName = f.name;
+      this.fileSize = f.size;
+      this.fileSizeText = fmtBytes(f.size);
+    },
+  };
+
   // ---------- wire up ----------
   function wire() {
     $("fileInput").addEventListener("change", async (e) => {
       const f = e.target.files[0];
       if (!f) return;
+      uploadUI.armForFile(f);
+      uploadUI.uploading(0);
       try {
-        const entry = await api.upload(f);
+        const entry = await api.upload(
+          f,
+          (pct) => { if (pct < 1) uploadUI.uploading(pct); },
+          () => uploadUI.parsing(),
+        );
+        uploadUI.idle();
         e.target.value = "";
         await refreshHistory();
         await selectPcap(entry.id);
       } catch (err) {
+        uploadUI.idle();
         alert(err.message);
       }
     });

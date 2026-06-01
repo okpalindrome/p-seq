@@ -1,15 +1,41 @@
-"""PCAP parser using Scapy. No prior knowledge of payload protocol required."""
+"""PCAP parser using Scapy. No prior knowledge of payload protocol required.
+
+Uses streaming readers (PcapReader / PcapNgReader) so memory stays bounded even
+for multi-GB captures — rdpcap() loads the whole file as Scapy objects and runs
+out of memory on anything past a few hundred MB.
+"""
 from __future__ import annotations
 
+import os
 import socket
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
-from scapy.all import rdpcap  # type: ignore
+from scapy.all import rdpcap  # type: ignore  # used only by parse_packet_detail (small reads)
+from scapy.utils import PcapReader, PcapNgReader  # type: ignore
 from scapy.packet import Packet, Raw  # type: ignore
 from scapy.layers.l2 import Ether  # type: ignore
 from scapy.layers.inet import IP, TCP, UDP, ICMP  # type: ignore
 from scapy.layers.inet6 import IPv6  # type: ignore
+
+
+# Hard ceilings to keep a single pcap from eating the whole machine.
+#   MAX_PACKETS — refuse pcaps above this with a clear "split it" message
+#   PAYLOAD_CAP_BYTES — how many raw payload bytes we hex-encode and keep on
+#                      each row (used by the diagram and the `payload contains`
+#                      filter). The full hex dump is still available via the
+#                      per-frame detail endpoint, which re-reads the pcap.
+MAX_PACKETS = 5_000_000
+PAYLOAD_CAP_BYTES = 512
+
+
+def _open_streaming_reader(path: str):
+    """Return a Scapy streaming reader, picking pcapng vs classic by magic."""
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if head == b"\x0a\x0d\x0d\x0a":
+        return PcapNgReader(path)
+    return PcapReader(path)
 
 
 # ---------- TCP flag name expansion ----------
@@ -144,115 +170,165 @@ def _layer_summary(layer: Packet) -> str:
 
 # ---------- public API ----------
 
-def parse_pcap(path: str) -> dict[str, Any]:
-    """Parse a pcap file and return a dict with metadata + list of packets."""
-    pkts = rdpcap(path)
+def parse_pcap(
+    path: str,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Parse a pcap file (classic or pcapng) and return summary + per-packet rows.
+
+    Streams the file so memory stays O(rows-built) rather than O(scapy-packets).
+    `progress_callback(packets_processed, file_offset_bytes)` is invoked
+    periodically — useful for hooking up a UI progress meter.
+    """
+    file_size = os.path.getsize(path)
 
     packets: list[dict[str, Any]] = []
     endpoints: dict[str, dict[str, Any]] = {}
     # conversation_key: f"{ip_a}|{ip_b}" (sorted) -> set of (port_a, port_b, proto)
     convos: dict[str, dict[str, Any]] = {}
 
-    for idx, pkt in enumerate(pkts, start=1):
-        ts = float(pkt.time) if hasattr(pkt, "time") else 0.0
-        when = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        size = len(bytes(pkt))
+    reader = _open_streaming_reader(path)
+    underlying = getattr(reader, "f", None)  # raw file handle for byte-offset progress
+    idx = 0
+    try:
+        while True:
+            try:
+                pkt = reader.read_packet()
+            except EOFError:
+                break
+            if pkt is None:
+                break
+            idx += 1
+            if idx > MAX_PACKETS:
+                raise ValueError(
+                    f"pcap exceeds the {MAX_PACKETS:,} packet limit. "
+                    "Split it first with: editcap -c 500000 in.pcap chunk_.pcap"
+                )
 
-        src_ip = dst_ip = None
-        src_mac = dst_mac = None
-        src_port = dst_port = None
-        proto = "UNKNOWN"
-        info = ""
+            ts = float(pkt.time) if hasattr(pkt, "time") else 0.0
+            when = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            size = len(bytes(pkt))
 
-        if Ether in pkt:
-            src_mac = pkt[Ether].src
-            dst_mac = pkt[Ether].dst
+            src_ip = dst_ip = None
+            src_mac = dst_mac = None
+            src_port = dst_port = None
+            proto = "UNKNOWN"
+            info = ""
 
-        if IP in pkt:
-            src_ip = pkt[IP].src
-            dst_ip = pkt[IP].dst
-        elif IPv6 in pkt:
-            src_ip = pkt[IPv6].src
-            dst_ip = pkt[IPv6].dst
+            if Ether in pkt:
+                src_mac = pkt[Ether].src
+                dst_mac = pkt[Ether].dst
 
-        if TCP in pkt:
-            proto = "TCP"
-            src_port = int(pkt[TCP].sport)
-            dst_port = int(pkt[TCP].dport)
-            flags_pretty = _tcp_flags_pretty(str(pkt[TCP].flags))
-            # Flags sit at the front of `info` so the arrow label reads
-            # "TCP [FIN, ACK] 12345 -> 80 ..." — flags adjacent to the proto.
-            info = f"[{flags_pretty}] {src_port} -> {dst_port} Seq={pkt[TCP].seq} Ack={pkt[TCP].ack} Win={pkt[TCP].window}"
-        elif UDP in pkt:
-            proto = "UDP"
-            src_port = int(pkt[UDP].sport)
-            dst_port = int(pkt[UDP].dport)
-            info = f"{src_port} -> {dst_port} Len={int(pkt[UDP].len)}"
-        elif ICMP in pkt:
-            proto = "ICMP"
-            info = f"Type={int(pkt[ICMP].type)} Code={int(pkt[ICMP].code)}"
-        elif IP in pkt:
-            proto = f"IP/{int(pkt[IP].proto)}"
-        elif Ether in pkt:
-            proto = f"Eth/0x{int(pkt[Ether].type):04x}"
+            if IP in pkt:
+                src_ip = pkt[IP].src
+                dst_ip = pkt[IP].dst
+            elif IPv6 in pkt:
+                src_ip = pkt[IPv6].src
+                dst_ip = pkt[IPv6].dst
 
-        # raw payload (the proprietary protocol bytes)
-        payload_bytes = b""
-        if Raw in pkt:
-            payload_bytes = bytes(pkt[Raw].load)
-        payload_hex = payload_bytes.hex()
+            if TCP in pkt:
+                proto = "TCP"
+                src_port = int(pkt[TCP].sport)
+                dst_port = int(pkt[TCP].dport)
+                flags_pretty = _tcp_flags_pretty(str(pkt[TCP].flags))
+                info = f"[{flags_pretty}] {src_port} -> {dst_port} Seq={pkt[TCP].seq} Ack={pkt[TCP].ack} Win={pkt[TCP].window}"
+            elif UDP in pkt:
+                proto = "UDP"
+                src_port = int(pkt[UDP].sport)
+                dst_port = int(pkt[UDP].dport)
+                info = f"{src_port} -> {dst_port} Len={int(pkt[UDP].len)}"
+            elif ICMP in pkt:
+                proto = "ICMP"
+                info = f"Type={int(pkt[ICMP].type)} Code={int(pkt[ICMP].code)}"
+            elif IP in pkt:
+                proto = f"IP/{int(pkt[IP].proto)}"
+            elif Ether in pkt:
+                proto = f"Eth/0x{int(pkt[Ether].type):04x}"
 
-        # full encapsulation chain for the summary row
-        encap = " / ".join(_layer_chain(pkt))
-
-        row = {
-            "frame": idx,
-            "time": when,
-            "epoch": ts,
-            "length": size,
-            "encap": encap,
-            "src_mac": src_mac,
-            "dst_mac": dst_mac,
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "src_port": src_port,
-            "dst_port": dst_port,
-            "proto": proto,
-            "info": info,
-            "payload_len": len(payload_bytes),
-            "payload_hex": payload_hex,
-        }
-        packets.append(row)
-
-        # track endpoints
-        if src_ip:
-            ep = endpoints.setdefault(src_ip, {"ip": src_ip, "mac": src_mac, "ports": set(), "packets": 0})
-            ep["packets"] += 1
-            if src_port is not None:
-                ep["ports"].add((src_port, proto))
-            if src_mac and not ep.get("mac"):
-                ep["mac"] = src_mac
-        if dst_ip:
-            ep = endpoints.setdefault(dst_ip, {"ip": dst_ip, "mac": dst_mac, "ports": set(), "packets": 0})
-            ep["packets"] += 1
-            if dst_port is not None:
-                ep["ports"].add((dst_port, proto))
-            if dst_mac and not ep.get("mac"):
-                ep["mac"] = dst_mac
-
-        # track conversations (unordered pair)
-        if src_ip and dst_ip:
-            a, b = sorted([src_ip, dst_ip])
-            key = f"{a}|{b}"
-            convo = convos.setdefault(key, {"a": a, "b": b, "ports": set(), "packets": 0, "protos": set()})
-            convo["packets"] += 1
-            convo["protos"].add(proto)
-            if src_port is not None and dst_port is not None:
-                # store port pair tied to the ordered direction-agnostic tuple
-                if src_ip == a:
-                    convo["ports"].add((src_port, dst_port, proto))
+            # Payload bytes — keep at most PAYLOAD_CAP_BYTES per row to bound
+            # memory. The full payload is still recoverable through the per-frame
+            # detail endpoint, which re-reads the pcap on demand.
+            payload_full_len = 0
+            payload_hex = ""
+            payload_truncated = False
+            if Raw in pkt:
+                raw = bytes(pkt[Raw].load)
+                payload_full_len = len(raw)
+                if payload_full_len > PAYLOAD_CAP_BYTES:
+                    payload_hex = raw[:PAYLOAD_CAP_BYTES].hex()
+                    payload_truncated = True
                 else:
-                    convo["ports"].add((dst_port, src_port, proto))
+                    payload_hex = raw.hex()
+
+            encap = " / ".join(_layer_chain(pkt))
+
+            row = {
+                "frame": idx,
+                "time": when,
+                "epoch": ts,
+                "length": size,
+                "encap": encap,
+                "src_mac": src_mac,
+                "dst_mac": dst_mac,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "proto": proto,
+                "info": info,
+                "payload_len": payload_full_len,
+                "payload_hex": payload_hex,
+                "payload_truncated": payload_truncated,
+            }
+            packets.append(row)
+
+            # track endpoints
+            if src_ip:
+                ep = endpoints.setdefault(src_ip, {"ip": src_ip, "mac": src_mac, "ports": set(), "packets": 0})
+                ep["packets"] += 1
+                if src_port is not None:
+                    ep["ports"].add((src_port, proto))
+                if src_mac and not ep.get("mac"):
+                    ep["mac"] = src_mac
+            if dst_ip:
+                ep = endpoints.setdefault(dst_ip, {"ip": dst_ip, "mac": dst_mac, "ports": set(), "packets": 0})
+                ep["packets"] += 1
+                if dst_port is not None:
+                    ep["ports"].add((dst_port, proto))
+                if dst_mac and not ep.get("mac"):
+                    ep["mac"] = dst_mac
+
+            # track conversations (unordered pair)
+            if src_ip and dst_ip:
+                a, b = sorted([src_ip, dst_ip])
+                key = f"{a}|{b}"
+                convo = convos.setdefault(key, {"a": a, "b": b, "ports": set(), "packets": 0, "protos": set()})
+                convo["packets"] += 1
+                convo["protos"].add(proto)
+                if src_port is not None and dst_port is not None:
+                    if src_ip == a:
+                        convo["ports"].add((src_port, dst_port, proto))
+                    else:
+                        convo["ports"].add((dst_port, src_port, proto))
+
+            # Periodic progress callback — every 5k packets keeps overhead near
+            # zero while still feeling responsive when the file is huge.
+            if progress_callback and (idx % 5000 == 0):
+                offset = 0
+                if underlying is not None:
+                    try:
+                        offset = underlying.tell()
+                    except Exception:
+                        offset = 0
+                try:
+                    progress_callback(idx, offset)
+                except Exception:
+                    pass
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
     # normalise sets to lists for JSON
     endpoints_out = []

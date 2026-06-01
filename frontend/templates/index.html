@@ -9,7 +9,7 @@
 <body>
 
 <header class="topbar">
-  <div class="brand">p-seq</div>
+  <div class="brand">P-SEQ</div>
   <div class="filterbox">
     <input id="filter" type="text" spellcheck="false"
            placeholder='display filter — e.g.  tcp && ip.addr == 10.0.0.1   |   udp.port == 53   |   payload contains 474554' />
@@ -26,9 +26,11 @@
 
   <aside class="sidebar">
     <div class="upload">
-      <label class="btn block" for="fileInput">Upload pcap</label>
+      <div id="uploadArea">
+        <label class="btn block" for="fileInput">Upload pcap</label>
+        <div class="muted small upload-hint">pcap / pcapng / cap</div>
+      </div>
       <input id="fileInput" type="file" accept=".pcap,.pcapng,.cap" hidden />
-      <div id="uploadHint" class="muted small">pcap / pcapng / cap</div>
     </div>
 
     <div id="portPicker" class="port-picker hidden">
