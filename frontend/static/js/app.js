@@ -49,16 +49,26 @@
   }
 
   // XHR-based upload — fetch() doesn't give upload progress events without the
-  // streams API. `onUploadPct(fraction)` is called continuously during the
-  // network upload; `onParsing()` fires once the bytes are fully on the wire
-  // and the server begins parsing (response not yet received).
+  // streams API. Returns { promise, cancel } so the caller can abort the
+  // request from a Cancel button without losing access to the result promise.
+  // `onUploadPct(fraction)` is called continuously during the network upload;
+  // `onParsing()` fires once the bytes are fully on the wire and the server
+  // begins parsing (response not yet received).
   function uploadWithProgress(file, onUploadPct, onParsing) {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      const fd = new FormData();
-      fd.append("file", file);
-      xhr.open("POST", "/api/pcaps");
-      xhr.setRequestHeader("X-Requested-By", "p-seq");
+    const xhr = new XMLHttpRequest();
+    const fd = new FormData();
+    fd.append("file", file);
+    // Token the server registers a cancellation event under, so the Cancel
+    // button can interrupt the server-side parse — not just the client-side
+    // network wait. uuid4 hyphenated form matches the server's token regex.
+    const opToken = (crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `tok-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    xhr.open("POST", "/api/pcaps");
+    xhr.setRequestHeader("X-Requested-By", "p-seq");
+    xhr.setRequestHeader("X-Op-Token", opToken);
+
+    const promise = new Promise((resolve, reject) => {
       xhr.upload.addEventListener("progress", (e) => {
         if (e.lengthComputable) onUploadPct(e.loaded / e.total);
       });
@@ -78,14 +88,32 @@
         }
       });
       xhr.addEventListener("error", () => reject(new Error("upload network error")));
-      xhr.addEventListener("abort", () => reject(new Error("upload aborted")));
+      xhr.addEventListener("abort", () => {
+        const e = new Error("cancelled");
+        e.name = "AbortError";
+        reject(e);
+      });
       xhr.send(fd);
     });
+
+    const cancel = async () => {
+      try { xhr.abort(); } catch {}
+      // Ask the server to stop processing too. Safe to call even before the
+      // parse has started — it just returns triggered=false.
+      try {
+        await fetch(`/api/uploads/${encodeURIComponent(opToken)}/cancel`, {
+          method: "POST",
+          headers: { ...CSRF_HEADERS },
+        });
+      } catch {}
+    };
+    return { promise, cancel };
   }
 
   const api = {
     async list() { return (await fetch("/api/pcaps")).json(); },
-    async upload(file, onUploadPct, onParsing) {
+    upload(file, onUploadPct, onParsing) {
+      // Returns { promise, cancel } — call cancel() to abort the XHR.
       return uploadWithProgress(file, onUploadPct, onParsing);
     },
     async del(id) {
@@ -215,6 +243,12 @@
   }
 
   async function selectPcap(id, entryHint) {
+    // If a previous load is still in flight (user clicked another pcap before
+    // the first one finished), abort it so the UI tracks the latest click.
+    if (state.activeLoad) {
+      try { state.activeLoad.abort(); } catch {}
+      state.activeLoad = null;
+    }
     state.currentPcap = id;
     state.selected = [];
     state.portChoice = { a: null, b: null };
@@ -227,21 +261,60 @@
       ? fmtBytes(entryHint.size_bytes)
       : "";
     const meta = sizeText ? `${name}   ·   ${sizeText}` : name;
-    loadingUI.busy("Loading pcap", meta);
+
+    const controller = new AbortController();
+    state.activeLoad = controller;
+    const cancelLoad = async () => {
+      try { controller.abort(); } catch {}
+      // Tell the server to stop the parse too — otherwise it'd keep
+      // running, cache the result, and waste CPU/RAM.
+      try {
+        await fetch(`/api/pcaps/${encodeURIComponent(id)}/cancel`, {
+          method: "POST",
+          headers: { ...CSRF_HEADERS },
+        });
+      } catch {}
+    };
+    loadingUI.busy("Loading pcap", meta, cancelLoad);
+
+    const fetchJson = async (url, fallback) => {
+      const r = await fetch(url, { signal: controller.signal });
+      if (!r.ok) return fallback;
+      return r.json();
+    };
 
     try {
       const [summary, labels, hidden] = await Promise.all([
-        api.summary(id), api.getLabels(id), api.getHidden(id),
+        fetchJson(`/api/pcaps/${id}/summary`, null),
+        fetchJson(`/api/pcaps/${id}/labels`, {}),
+        fetchJson(`/api/pcaps/${id}/hidden`, []),
       ]);
+      if (!summary) throw new Error("summary failed");
       state.summary = summary;
       state.labels = labels || {};
       state.hidden = new Set(hidden || []);
     } catch (e) {
       loadingUI.idle();
+      state.activeLoad = null;
+      if (e && e.name === "AbortError") {
+        // User cancelled — reset to no-pcap-selected state silently. Note
+        // that the server-side parse may still be running and will complete
+        // (and be cached) in the background; that's fine and means the next
+        // click on the same pcap will return instantly.
+        state.currentPcap = null;
+        state.summary = null;
+        refreshHistory();
+        renderEndpoints();
+        renderPortPicker();
+        renderDiagram();
+        setDiagramTitle();
+        return;
+      }
       alert(e.message || "failed to load pcap");
       return;
     }
     loadingUI.idle();
+    state.activeLoad = null;
     refreshHistory();
     renderEndpoints();
     renderPortPicker();
@@ -349,7 +422,8 @@
   const loadingUI = {
     timer: null,
     start: 0,
-    busy(stage, meta) {
+    cancelHandler: null,
+    busy(stage, meta, onCancel) {
       this._clear();
       this.start = Date.now();
       $("loadingStage").textContent = stage;
@@ -361,10 +435,25 @@
       };
       tick();
       this.timer = setInterval(tick, 200);
+
+      const btn = $("loadCancelBtn");
+      if (btn) {
+        if (this.cancelHandler) btn.removeEventListener("click", this.cancelHandler);
+        this.cancelHandler = onCancel || null;
+        if (this.cancelHandler) {
+          btn.addEventListener("click", this.cancelHandler);
+          btn.classList.remove("hidden");
+        } else {
+          btn.classList.add("hidden");
+        }
+      }
     },
     idle() {
       this._clear();
       $("loadingOverlay").classList.add("hidden");
+      const btn = $("loadCancelBtn");
+      if (btn && this.cancelHandler) btn.removeEventListener("click", this.cancelHandler);
+      this.cancelHandler = null;
     },
     _clear() {
       if (this.timer) { clearInterval(this.timer); this.timer = null; }
@@ -1234,9 +1323,21 @@
     parseTimer: null,
     parseStart: 0,
     fileSizeText: "",
+    onCancel: null,
+
+    _cancelMarkup() {
+      return this.onCancel
+        ? `<div class="cancel-row"><button id="uploadCancelBtn" class="btn ghost small">Cancel</button></div>`
+        : "";
+    },
+    _wireCancel() {
+      const btn = $("uploadCancelBtn");
+      if (btn && this.onCancel) btn.addEventListener("click", this.onCancel);
+    },
 
     idle() {
       this._clearTimer();
+      this.onCancel = null;
       $("uploadArea").innerHTML = `
         <label class="btn block" for="fileInput">Upload pcap</label>
         <div class="muted small upload-hint">pcap / pcapng / cap</div>
@@ -1257,8 +1358,10 @@
             <span>${escapeHTML(this.fileName || "")}</span>
             <span>${escapeHTML(sent)} / ${escapeHTML(this.fileSizeText)}</span>
           </div>
+          ${this._cancelMarkup()}
         </div>
       `;
+      this._wireCancel();
     },
     parsing() {
       this._clearTimer();
@@ -1274,10 +1377,12 @@
             <div class="upload-bar"><div class="upload-bar-fill indeterminate"></div></div>
             <div class="upload-progress-meta">
               <span>${escapeHTML(this.fileName || "")}</span>
-              <span>${escapeHTML(this.fileSizeText)} · scapy rdpcap</span>
+              <span>${escapeHTML(this.fileSizeText)} · scapy</span>
             </div>
+            ${this._cancelMarkup()}
           </div>
         `;
+        this._wireCancel();
       };
       tick();
       this.parseTimer = setInterval(tick, 200);
@@ -1285,10 +1390,11 @@
     _clearTimer() {
       if (this.parseTimer) { clearInterval(this.parseTimer); this.parseTimer = null; }
     },
-    armForFile(f) {
+    armForFile(f, onCancel) {
       this.fileName = f.name;
       this.fileSize = f.size;
       this.fileSizeText = fmtBytes(f.size);
+      this.onCancel = onCancel || null;
     },
   };
 
@@ -1297,20 +1403,28 @@
     $("fileInput").addEventListener("change", async (e) => {
       const f = e.target.files[0];
       if (!f) return;
-      uploadUI.armForFile(f);
+      const handle = api.upload(
+        f,
+        (pct) => { if (pct < 1) uploadUI.uploading(pct); },
+        () => uploadUI.parsing(),
+      );
+      uploadUI.armForFile(f, handle.cancel);
       uploadUI.uploading(0);
+      e.target.value = "";
       try {
-        const entry = await api.upload(
-          f,
-          (pct) => { if (pct < 1) uploadUI.uploading(pct); },
-          () => uploadUI.parsing(),
-        );
+        const entry = await handle.promise;
         uploadUI.idle();
-        e.target.value = "";
         await refreshHistory();
         await selectPcap(entry.id, entry);
       } catch (err) {
         uploadUI.idle();
+        if (err && err.name === "AbortError") {
+          // user-initiated cancel — silent. Note: if the upload had already
+          // finished and the server was in the parsing phase, the parse may
+          // still complete in the background and create the pcap entry; the
+          // user can delete it from History if they don't want it.
+          return;
+        }
         alert(err.message);
       }
     });

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -13,8 +15,43 @@ from flask import Flask, jsonify, request, send_from_directory, abort
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
-from backend.parser import parse_pcap, parse_packet_detail
+from backend.parser import parse_pcap, parse_packet_detail, PCapCancelled
 from backend.filter_expr import compile_filter
+
+
+# ---------- cooperative parse-cancellation registry ----------
+# Each long-running parse registers a threading.Event under a string key
+# ("upload:<token>" for uploads, "pcap:<id>" for cached loads). Cancel
+# endpoints set the event; parse_pcap polls it every 1024 packets and raises
+# PCapCancelled when it fires. Werkzeug's dev server is threaded by default
+# (we pass threaded=True at run()), so the cancel POST can land in a separate
+# thread while the parse worker thread is busy.
+_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_CANCEL_LOCK = threading.Lock()
+
+
+def _register_cancel(key: str) -> threading.Event:
+    ev = threading.Event()
+    with _CANCEL_LOCK:
+        _CANCEL_EVENTS[key] = ev
+    return ev
+
+
+def _trigger_cancel(key: str) -> bool:
+    with _CANCEL_LOCK:
+        ev = _CANCEL_EVENTS.get(key)
+    if ev:
+        ev.set()
+        return True
+    return False
+
+
+def _release_cancel(key: str) -> None:
+    with _CANCEL_LOCK:
+        _CANCEL_EVENTS.pop(key, None)
+
+
+_VALID_OP_TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 HERE = Path(__file__).resolve().parent
@@ -129,17 +166,85 @@ def _get_entry(pcap_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _ensure_parsed(pcap_id: str) -> dict[str, Any]:
+# Bump this whenever a packet-row field name/shape changes so old pickled
+# caches are invalidated and re-parsed cleanly instead of confusing the UI.
+PARSED_CACHE_VERSION = 1
+
+
+def _parsed_cache_path(pcap_id: str) -> Path:
+    if not _VALID_PCAP_ID.match(pcap_id):
+        raise ValueError("invalid pcap id")
+    return _safe_storage_path(f"{pcap_id}_parsed.pkl")
+
+
+def _load_parsed_from_disk(pcap_id: str) -> dict[str, Any] | None:
+    """Return the cached parsed dict if available + current-version, else None.
+
+    A corrupt or stale-schema cache is silently deleted so the caller falls
+    through to the slow scapy path and re-writes a fresh cache.
+    """
+    p = _parsed_cache_path(pcap_id)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "rb") as fh:
+            data = pickle.load(fh)
+        if isinstance(data, dict) and data.get("_schema_version") == PARSED_CACHE_VERSION:
+            data.pop("_schema_version", None)
+            return data
+        p.unlink(missing_ok=True)
+        return None
+    except Exception:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def _save_parsed_to_disk(pcap_id: str, parsed: dict[str, Any]) -> None:
+    """Pickle the parsed dict so the next open (even after a server restart)
+    is instant — Scapy doesn't have to walk the whole pcap again."""
+    p = _parsed_cache_path(pcap_id)
+    try:
+        out = dict(parsed)
+        out["_schema_version"] = PARSED_CACHE_VERSION
+        # Write to a temp file then rename — avoids leaving a half-written
+        # pickle on disk if the process is killed mid-dump on a multi-GB file.
+        tmp = p.with_suffix(p.suffix + ".part")
+        with open(tmp, "wb") as fh:
+            pickle.dump(out, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, p)
+    except Exception:
+        # Cache write failure must never break the request that produced the
+        # parse — just clean up partial output and move on.
+        try:
+            (p.with_suffix(p.suffix + ".part")).unlink()
+        except Exception:
+            pass
+
+
+def _ensure_parsed(pcap_id: str, cancel_event: threading.Event | None = None) -> dict[str, Any]:
+    # Fast path #1: already in this process's RAM cache.
     if pcap_id in _CACHE:
         return _CACHE[pcap_id]
+
+    # Fast path #2: pickle on disk from a previous parse (survives restart).
+    disk = _load_parsed_from_disk(pcap_id)
+    if disk is not None:
+        _CACHE[pcap_id] = disk
+        return disk
+
+    # Slow path: stream the pcap through Scapy.
     entry = _get_entry(pcap_id)
     if not entry:
         abort(404, description="pcap not found")
     path = _safe_storage_path(entry["filename"])
     if not path.exists():
         abort(404, description="pcap file missing on disk")
-    parsed = parse_pcap(str(path))
+    parsed = parse_pcap(str(path), cancel_event=cancel_event)
     _CACHE[pcap_id] = parsed
+    _save_parsed_to_disk(pcap_id, parsed)
     return parsed
 
 
@@ -273,12 +378,30 @@ def upload_pcap():
     dest = _safe_storage_path(stored_name)
     f.save(str(dest))
 
-    # parse once up front so we know it works and we can cache
+    # If the client supplied an upload token, register a cancellation event
+    # under it so a POST /api/uploads/<token>/cancel can stop the parse cleanly.
+    op_token = request.headers.get("X-Op-Token", "").strip()
+    cancel_event = None
+    cancel_key = None
+    if op_token and _VALID_OP_TOKEN.match(op_token):
+        cancel_key = f"upload:{op_token}"
+        cancel_event = _register_cancel(cancel_key)
+
+    # parse once up front so we know it works and we can cache. Finally
+    # block guarantees the cancel event is unregistered even if the response
+    # never reaches the client (e.g. they closed the tab).
     try:
-        parsed = parse_pcap(str(dest))
-    except Exception as e:
-        dest.unlink(missing_ok=True)
-        return jsonify(error=f"failed to parse: {e}"), 400
+        try:
+            parsed = parse_pcap(str(dest), cancel_event=cancel_event)
+        except PCapCancelled:
+            dest.unlink(missing_ok=True)
+            return jsonify(error="cancelled"), 499
+        except Exception as e:
+            dest.unlink(missing_ok=True)
+            return jsonify(error=f"failed to parse: {e}"), 400
+    finally:
+        if cancel_key:
+            _release_cancel(cancel_key)
 
     entry = {
         "id": pcap_id,
@@ -292,6 +415,8 @@ def upload_pcap():
     items.insert(0, entry)
     _save_index(items)
     _CACHE[pcap_id] = parsed
+    # Persist so the next open (e.g. after a server restart) skips Scapy.
+    _save_parsed_to_disk(pcap_id, parsed)
     return jsonify(entry)
 
 
@@ -306,13 +431,15 @@ def delete_pcap(pcap_id: str):
     new_items = [it for it in items if it["id"] != pcap_id]
     if len(new_items) == len(items):
         return jsonify(error="not found"), 404
-    # find the file and its sidecar files (labels, hidden), delete all of them
+    # find the file and its sidecar files (labels, hidden, parsed-cache),
+    # delete all of them
     for it in items:
         if it["id"] == pcap_id:
             for resolver in (
                 lambda: _safe_storage_path(it["filename"]),
                 lambda: _labels_path(pcap_id),
                 lambda: _hidden_path(pcap_id),
+                lambda: _parsed_cache_path(pcap_id),
             ):
                 try:
                     resolver().unlink(missing_ok=True)
@@ -327,13 +454,26 @@ def delete_pcap(pcap_id: str):
 
 @app.get("/api/pcaps/<pcap_id>/summary")
 def pcap_summary(pcap_id: str):
-    """Endpoints + conversations + total — used to populate the party selectors."""
-    parsed = _ensure_parsed(pcap_id)
-    return jsonify({
-        "total": parsed["total"],
-        "endpoints": parsed["endpoints"],
-        "conversations": parsed["conversations"],
-    })
+    """Endpoints + conversations + total — used to populate the party selectors.
+
+    For uncached pcaps this triggers parse_pcap, which can take minutes on a
+    multi-GB capture. We register a cancellation event so a parallel POST to
+    /api/pcaps/<id>/cancel can stop the parse without leaving CPU spinning.
+    """
+    cancel_key = f"pcap:{pcap_id}"
+    cancel_event = _register_cancel(cancel_key)
+    try:
+        try:
+            parsed = _ensure_parsed(pcap_id, cancel_event=cancel_event)
+        except PCapCancelled:
+            return jsonify(error="cancelled"), 499
+        return jsonify({
+            "total": parsed["total"],
+            "endpoints": parsed["endpoints"],
+            "conversations": parsed["conversations"],
+        })
+    finally:
+        _release_cancel(cancel_key)
 
 
 @app.post("/api/pcaps/<pcap_id>/packets")
@@ -616,6 +756,28 @@ def batch_hidden(pcap_id: str):
     return jsonify(ok=True, count=len(h))
 
 
+# ---------- parse cancellation endpoints ----------
+
+@app.post("/api/pcaps/<pcap_id>/cancel")
+def cancel_pcap_parse(pcap_id: str):
+    """Signal a server-side parse to stop. Safe to call even if no parse is
+    in flight — returns triggered=false in that case."""
+    triggered = _trigger_cancel(f"pcap:{pcap_id}")
+    return jsonify(ok=True, triggered=triggered)
+
+
+@app.post("/api/uploads/<op_token>/cancel")
+def cancel_upload_parse(op_token: str):
+    """Companion of /api/pcaps/<id>/cancel for the upload flow where the
+    pcap_id isn't known to the client yet (server generates it on success).
+    Client picks an opaque op_token, sends it via X-Op-Token on upload, and
+    POSTs to this endpoint to abort the in-progress parse."""
+    if not _VALID_OP_TOKEN.match(op_token):
+        return jsonify(error="invalid token"), 400
+    triggered = _trigger_cancel(f"upload:{op_token}")
+    return jsonify(ok=True, triggered=triggered)
+
+
 # ---------- entry point ----------
 
 if __name__ == "__main__":
@@ -625,4 +787,8 @@ if __name__ == "__main__":
     debug = os.environ.get("P_SEQ_DEBUG") == "1"
     host = os.environ.get("P_SEQ_HOST", "127.0.0.1")
     port = int(os.environ.get("P_SEQ_PORT", "5050"))
-    app.run(host=host, port=port, debug=debug)
+    # threaded=True is required so the cancel POST can run while a parse
+    # request is occupying another thread. Flask defaults to threaded=True
+    # in modern versions, but we set it explicitly to make the requirement
+    # obvious to anyone reading this.
+    app.run(host=host, port=port, debug=debug, threaded=True)

@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
+
+
+class PCapCancelled(Exception):
+    """Raised by parse_pcap when its cancel_event fires mid-loop."""
 
 from scapy.all import rdpcap  # type: ignore  # used only by parse_packet_detail (small reads)
 from scapy.utils import PcapReader, PcapNgReader  # type: ignore
@@ -173,6 +178,7 @@ def _layer_summary(layer: Packet) -> str:
 def parse_pcap(
     path: str,
     progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Parse a pcap file (classic or pcapng) and return summary + per-packet rows.
 
@@ -204,6 +210,13 @@ def parse_pcap(
                     f"pcap exceeds the {MAX_PACKETS:,} packet limit. "
                     "Split it first with: editcap -c 500000 in.pcap chunk_.pcap"
                 )
+
+            # Cooperative cancellation — check every 1024 packets so the
+            # overhead is negligible (~one Event.is_set() call per ms of
+            # parsing) while still feeling responsive to a Cancel click.
+            if cancel_event is not None and (idx & 0x3FF) == 0:
+                if cancel_event.is_set():
+                    raise PCapCancelled("parse cancelled")
 
             ts = float(pkt.time) if hasattr(pkt, "time") else 0.0
             when = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
