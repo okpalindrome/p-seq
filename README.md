@@ -89,7 +89,7 @@ and starts the app on **http://127.0.0.1:5050**.
 8. **Export PNG** — saves the full-size diagram with the current labels and
    styling, at 2× pixel ratio.
 
-
+![Demo](./p-seq-demo.gif)
 
 ## Display filter syntax
 
